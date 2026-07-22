@@ -178,3 +178,65 @@ ALTER TABLE "negotiation_sessions" ADD CONSTRAINT "negotiation_sessions_conflict
 -- AddForeignKey
 ALTER TABLE "negotiation_participants" ADD CONSTRAINT "negotiation_participants_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "negotiation_sessions"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
+-- AddForeignKey
+ALTER TABLE "negotiation_participants" ADD CONSTRAINT "negotiation_participants_contractorId_fkey" FOREIGN KEY ("contractorId") REFERENCES "trade_contractors"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "negotiation_rounds" ADD CONSTRAINT "negotiation_rounds_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "negotiation_sessions"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "negotiation_outcomes" ADD CONSTRAINT "negotiation_outcomes_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "negotiation_sessions"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "risk_assessments" ADD CONSTRAINT "risk_assessments_taskId_fkey" FOREIGN KEY ("taskId") REFERENCES "tasks"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "equipment" ADD CONSTRAINT "equipment_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "projects"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "equipment" ADD CONSTRAINT "equipment_supplierId_fkey" FOREIGN KEY ("supplierId") REFERENCES "suppliers"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "shipment_events" ADD CONSTRAINT "shipment_events_equipmentId_fkey" FOREIGN KEY ("equipmentId") REFERENCES "equipment"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "specification_documents" ADD CONSTRAINT "specification_documents_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "projects"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "spec_requirements" ADD CONSTRAINT "spec_requirements_specDocId_fkey" FOREIGN KEY ("specDocId") REFERENCES "specification_documents"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "submittals" ADD CONSTRAINT "submittals_contractorId_fkey" FOREIGN KEY ("contractorId") REFERENCES "trade_contractors"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "submittals" ADD CONSTRAINT "submittals_equipmentId_fkey" FOREIGN KEY ("equipmentId") REFERENCES "equipment"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "submittals" ADD CONSTRAINT "submittals_requirementId_fkey" FOREIGN KEY ("requirementId") REFERENCES "spec_requirements"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "non_conformances" ADD CONSTRAINT "non_conformances_submittalId_fkey" FOREIGN KEY ("submittalId") REFERENCES "submittals"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "non_conformances" ADD CONSTRAINT "non_conformances_requirementId_fkey" FOREIGN KEY ("requirementId") REFERENCES "spec_requirements"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "non_conformances" ADD CONSTRAINT "non_conformances_taskId_fkey" FOREIGN KEY ("taskId") REFERENCES "tasks"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "rfis" ADD CONSTRAINT "rfis_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "projects"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "rfis" ADD CONSTRAINT "rfis_taskId_fkey" FOREIGN KEY ("taskId") REFERENCES "tasks"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "change_orders" ADD CONSTRAINT "change_orders_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "projects"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "commissioning_tests" ADD CONSTRAINT "commissioning_tests_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "projects"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "audit_logs" ADD CONSTRAINT "audit_logs_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "projects"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "audit_logs" ADD CONSTRAINT "audit_logs_actorId_fkey" FOREIGN KEY ("actorId") REFERENCES "user_profiles"("id") ON DELETE SET NULL ON UPDATE CASCADE;
