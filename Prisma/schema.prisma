@@ -1,0 +1,638 @@
+// ============================================================================
+// EPC Project Intelligence Platform — Prisma Schema
+// Target: PostgreSQL on Supabase (Free Tier)
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================================
+// CORE PROJECT & IDENTITY
+// ============================================================================
+
+model Project {
+  id            String   @id @default(uuid())
+  name          String
+  siteName      String
+  siteLat       Float
+  siteLng       Float
+  tierTarget    String // "Tier III" | "Tier IV" (Uptime Institute)
+  capacityMw    Float
+  startDate     DateTime
+  targetEndDate DateTime
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  contractors    TradeContractor[]
+  tasks          Task[]
+  equipment      Equipment[]
+  specDocs       SpecificationDocument[]
+  rfis           RFI[]
+  changeOrders   ChangeOrder[]
+  commissioning  CommissioningTest[]
+  auditLogs      AuditLog[]
+
+  @@map("projects")
+}
+
+/// Mirrors Supabase auth.users — application-level profile row.
+/// Supabase Auth owns credentials; this table owns app roles & metadata.
+model UserProfile {
+  id          String   @id // matches supabase auth.users.id
+  email       String   @unique
+  fullName    String
+  role        UserRole @default(ENGINEER)
+  discipline  String?
+  createdAt   DateTime @default(now())
+
+  auditLogs   AuditLog[]
+
+  @@map("user_profiles")
+}
+
+enum UserRole {
+  ADMIN
+  PMO
+  ENGINEER
+  QA_QC
+  CONTRACTOR_REP
+  VIEWER
+}
+
+// ============================================================================
+// TRADE CONTRACTORS — the negotiating agents' real-world constraint set
+// ============================================================================
+
+model TradeContractor {
+  id                   String   @id @default(uuid())
+  projectId            String
+  project              Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  companyName          String
+  trade                String   // e.g. "Electrical - LV/MV", "Mechanical - Chilled Water", "Fire & Life Safety"
+  crewSize             Int      // available crew headcount on this site
+  crewSizeFlex         Int      @default(0) // additional crew that can be mobilized within `mobilizationDays`
+  mobilizationDays     Int      @default(7)
+  otherActiveSites     Int      @default(0) // count of other concurrent job commitments
+  penaltyExposureInr   Decimal  @db.Decimal(14, 2) // liquidated-damages exposure if this contractor causes delay
+  dailyPenaltyRateInr  Decimal  @db.Decimal(12, 2)
+  floatProtectionBias  Float    @default(0.5) // 0..1 — how strongly this agent resists giving up float (self-interest parameter)
+  reliabilityScore     Float    @default(0.75) // 0..1 — historical on-time performance, feeds negotiation weight
+  contactName          String
+  contactPhone         String
+
+  tasks                Task[]
+  submittals            Submittal[]
+  negotiationPositions  NegotiationParticipant[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+  @@map("trade_contractors")
+}
+
+// ============================================================================
+// SCHEDULE — tasks, dependencies, critical path cache
+// ============================================================================
+
+model Task {
+  id               String       @id @default(uuid())
+  projectId        String
+  project          Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  contractorId     String?
+  contractor       TradeContractor? @relation(fields: [contractorId], references: [id])
+
+  wbsCode          String
+  name             String
+  discipline       String
+  system           String? // e.g. "UPS Plant", "Chilled Water", "Structured Cabling"
+  zone             String? // physical zone/floor — used for space-clash detection
+
+  plannedStart     DateTime
+  plannedEnd       DateTime
+  durationDays     Int
+  percentComplete  Float        @default(0)
+  status           TaskStatus   @default(NOT_STARTED)
+  isMilestone      Boolean      @default(false)
+
+  // --- Critical Path Method cache (recomputed deterministically, never by LLM) ---
+  earlyStart       Int?         // day offset from project start
+  earlyFinish      Int?
+  lateStart        Int?
+  lateFinish       Int?
+  totalFloatDays   Int?
+  isCritical       Boolean      @default(false)
+  cpmComputedAt    DateTime?
+
+  predecessorLinks TaskDependency[] @relation("SuccessorTask")
+  successorLinks   TaskDependency[] @relation("PredecessorTask")
+
+  conflictsAsA     ScheduleConflict[] @relation("TaskA")
+  conflictsAsB     ScheduleConflict[] @relation("TaskB")
+
+  riskAssessments  RiskAssessment[]
+  rfis             RFI[]
+  nonConformances  NonConformance[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, wbsCode])
+  @@index([projectId])
+  @@index([contractorId])
+  @@index([isCritical])
+  @@map("tasks")
+}
+
+enum TaskStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETE
+  ON_HOLD
+  DELAYED
+}
+
+model TaskDependency {
+  id              String        @id @default(uuid())
+  predecessorId   String
+  predecessor     Task          @relation("PredecessorTask", fields: [predecessorId], references: [id], onDelete: Cascade)
+  successorId     String
+  successor       Task          @relation("SuccessorTask", fields: [successorId], references: [id], onDelete: Cascade)
+  type            DependencyType @default(FS)
+  lagDays         Int           @default(0)
+
+  @@unique([predecessorId, successorId])
+  @@index([successorId])
+  @@map("task_dependencies")
+}
+
+enum DependencyType {
+  FS // Finish-to-Start
+  SS // Start-to-Start
+  FF // Finish-to-Finish
+  SF // Start-to-Finish
+}
+
+// ============================================================================
+// SCHEDULE CONFLICTS & MULTI-AGENT NEGOTIATION
+// (the core Contractor Negotiation Scheduler)
+// ============================================================================
+
+model ScheduleConflict {
+  id            String         @id @default(uuid())
+  taskAId       String
+  taskA         Task           @relation("TaskA", fields: [taskAId], references: [id])
+  taskBId       String
+  taskB         Task           @relation("TaskB", fields: [taskBId], references: [id])
+
+  conflictType  ConflictType
+  severity      ConflictSeverity
+  description   String
+  detectedAt    DateTime       @default(now())
+  status        ConflictStatus @default(OPEN)
+
+  negotiations  NegotiationSession[]
+
+  @@index([status])
+  @@map("schedule_conflicts")
+}
+
+enum ConflictType {
+  RESOURCE_CLASH   // same contractor / crew double-booked
+  SPACE_CLASH      // two trades need the same zone simultaneously
+  SEQUENCE_CLASH   // predecessor slip threatens successor start
+  CREW_OVERCOMMIT  // contractor's other active sites exceed available crew flex
+}
+
+enum ConflictSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL // sits on the critical path
+}
+
+enum ConflictStatus {
+  OPEN
+  NEGOTIATING
+  RESOLVED
+  ESCALATED // negotiation failed to reach Pareto-improving outcome, needs PMO
+}
+
+model NegotiationSession {
+  id                 String    @id @default(uuid())
+  conflictId         String
+  conflict           ScheduleConflict @relation(fields: [conflictId], references: [id], onDelete: Cascade)
+
+  mechanism          String    @default("nash_bargaining") // mechanism-design method used
+  status             NegotiationStatus @default(RUNNING)
+  totalRounds        Int       @default(0)
+  paretoImproving    Boolean?  // null until concluded
+  nashProduct        Float?    // final Nash product value (utility_A * utility_B, normalized)
+  daysOfDelaySaved   Float?
+
+  participants       NegotiationParticipant[]
+  rounds             NegotiationRound[]
+  outcome            NegotiationOutcome?
+
+  createdAt          DateTime  @default(now())
+  resolvedAt         DateTime?
+
+  @@index([conflictId])
+  @@map("negotiation_sessions")
+}
+
+enum NegotiationStatus {
+  RUNNING
+  CONVERGED
+  ESCALATED
+}
+
+model NegotiationParticipant {
+  id                String   @id @default(uuid())
+  sessionId         String
+  session           NegotiationSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  contractorId      String
+  contractor        TradeContractor @relation(fields: [contractorId], references: [id])
+
+  reservationValue  Float    // BATNA — utility this agent gets if negotiation fails (walk-away point)
+  initialPositionJson Json   // starting offer: {startDay, endDay, crewAllocated}
+  finalPositionJson   Json?  // agreed position after negotiation
+  utilityGain         Float? // utility delta vs reservationValue at final position
+
+  @@index([sessionId])
+  @@map("negotiation_participants")
+}
+
+model NegotiationRound {
+  id             String   @id @default(uuid())
+  sessionId      String
+  session        NegotiationSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  roundNumber    Int
+  proposalsJson  Json     // array of {contractorId, offer, utility} for this round
+  concessionGap  Float    // remaining distance between offers, drives convergence check
+  accepted       Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@index([sessionId])
+  @@map("negotiation_rounds")
+}
+
+model NegotiationOutcome {
+  id                String   @id @default(uuid())
+  sessionId         String   @unique
+  session           NegotiationSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  resolutionJson    Json     // final {taskId -> {newStart, newEnd}} map, deterministic algorithm output
+  explanationText   String?  // LLM-generated plain-language explanation of *why* (reasoning layer only)
+  explanationModel  String?  // which model produced it, e.g. "qwen2.5:7b-instruct"
+  confidenceScore   Float?   // deterministic confidence from the algorithm (not the LLM)
+
+  createdAt         DateTime @default(now())
+
+  @@map("negotiation_outcomes")
+}
+
+// ============================================================================
+// RISK — Predictive Schedule Risk Engine (rule-engine / ML scored, cached)
+// ============================================================================
+
+model RiskAssessment {
+  id            String   @id @default(uuid())
+  taskId        String
+  task          Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  riskScore     Float    // 0..100, deterministic weighted rule-engine output
+  riskBand      RiskBand
+  factorsJson   Json     // {floatDays, weatherExposure, contractorReliability, leadTimeSlip, ...} with weights
+  computedAt    DateTime @default(now())
+
+  @@index([taskId])
+  @@index([riskBand])
+  @@map("risk_assessments")
+}
+
+enum RiskBand {
+  LOW
+  MODERATE
+  HIGH
+  SEVERE
+}
+
+// ============================================================================
+// SUPPLY CHAIN — equipment, suppliers, shipment tracking
+// ============================================================================
+
+model Supplier {
+  id               String   @id @default(uuid())
+  name             String
+  tier             Int      @default(1) // 1 = direct OEM, 2/3 = sub-tier
+  country          String
+  reliabilityScore Float    @default(0.8) // 0..1, historical on-time delivery
+  equipment        Equipment[]
+
+  @@map("suppliers")
+}
+
+model Equipment {
+  id                  String   @id @default(uuid())
+  projectId           String
+  project             Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  supplierId          String
+  supplier            Supplier @relation(fields: [supplierId], references: [id])
+
+  category            EquipmentCategory
+  tagNumber           String
+  description         String
+  isLongLead          Boolean  @default(false)
+  orderDate           DateTime
+  promisedDelivery    DateTime
+  revisedDelivery     DateTime?
+  actualDelivery      DateTime?
+  status              EquipmentStatus @default(ORDERED)
+  originLat           Float
+  originLng           Float
+  destinationLat       Float
+  destinationLng        Float
+
+  shipmentEvents      ShipmentEvent[]
+  submittals          Submittal[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, tagNumber])
+  @@index([projectId])
+  @@index([status])
+  @@map("equipment")
+}
+
+enum EquipmentCategory {
+  UPS_SYSTEM
+  GENERATOR
+  COOLING_TOWER
+  CHILLER
+  SWITCHGEAR
+  TRANSFORMER
+  CRAC_CRAH
+  STRUCTURED_CABLING
+  FIRE_SUPPRESSION
+  BMS_CONTROLS
+}
+
+enum EquipmentStatus {
+  ORDERED
+  IN_FABRICATION
+  IN_TRANSIT
+  CUSTOMS_HOLD
+  DELIVERED
+  DELAYED
+}
+
+model ShipmentEvent {
+  id           String   @id @default(uuid())
+  equipmentId  String
+  equipment    Equipment @relation(fields: [equipmentId], references: [id], onDelete: Cascade)
+
+  eventType    String   // "departed_factory" | "port_loaded" | "in_transit" | "port_arrived" | "customs" | "delivered"
+  lat          Float
+  lng          Float
+  eventDate    DateTime
+  note         String?
+
+  @@index([equipmentId])
+  @@map("shipment_events")
+}
+
+// ============================================================================
+// SPECIFICATION & QUALITY COMPLIANCE
+// ============================================================================
+
+model SpecificationDocument {
+  id          String   @id @default(uuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  title       String
+  standardRef String   // e.g. "TIA-942-B", "Uptime Institute Tier III", "BICSI 002"
+  version     String
+
+  requirements SpecRequirement[]
+
+  @@index([projectId])
+  @@map("specification_documents")
+}
+
+model SpecRequirement {
+  id            String   @id @default(uuid())
+  specDocId     String
+  specDoc       SpecificationDocument @relation(fields: [specDocId], references: [id], onDelete: Cascade)
+
+  clauseRef     String
+  parameter     String   // e.g. "Redundant power path count", "Raised floor clearance"
+  requiredValue String
+  unit          String?
+  toleranceLow  Float?
+  toleranceHigh Float?
+
+  submittals       Submittal[]
+  nonConformances  NonConformance[]
+
+  @@index([specDocId])
+  @@map("spec_requirements")
+}
+
+model Submittal {
+  id              String   @id @default(uuid())
+  projectId       String
+  contractorId    String
+  contractor      TradeContractor @relation(fields: [contractorId], references: [id])
+  equipmentId     String?
+  equipment       Equipment? @relation(fields: [equipmentId], references: [id])
+  requirementId   String?
+  requirement     SpecRequirement? @relation(fields: [requirementId], references: [id])
+
+  submittalNumber String
+  title           String
+  submittedValue  String
+  submittedAt     DateTime
+  status          SubmittalStatus @default(PENDING_REVIEW)
+  reviewedAt      DateTime?
+
+  nonConformances NonConformance[]
+
+  @@unique([projectId, submittalNumber])
+  @@index([projectId])
+  @@index([status])
+  @@map("submittals")
+}
+
+enum SubmittalStatus {
+  PENDING_REVIEW
+  APPROVED
+  APPROVED_AS_NOTED
+  REJECTED
+  REVISE_RESUBMIT
+}
+
+model NonConformance {
+  id             String   @id @default(uuid())
+  submittalId    String?
+  submittal      Submittal? @relation(fields: [submittalId], references: [id])
+  requirementId  String?
+  requirement    SpecRequirement? @relation(fields: [requirementId], references: [id])
+  taskId         String?
+  task           Task?    @relation(fields: [taskId], references: [id])
+
+  severity       NcSeverity
+  description    String
+  deviationDetail String  // deterministic diff explanation (required vs submitted)
+  status         NcStatus @default(OPEN)
+  raisedByAgent  String   @default("spec-compliance-agent")
+  raisedAt       DateTime @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status])
+  @@map("non_conformances")
+}
+
+enum NcSeverity {
+  MINOR
+  MAJOR
+  CRITICAL
+}
+
+enum NcStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  WAIVED
+}
+
+// ============================================================================
+// RFI & PROJECT KNOWLEDGE
+// ============================================================================
+
+model RFI {
+  id             String   @id @default(uuid())
+  projectId      String
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  taskId         String?
+  task           Task?    @relation(fields: [taskId], references: [id])
+
+  number         String
+  subject        String
+  question       String
+  discipline     String
+  raisedBy       String
+  status         RfiStatus @default(OPEN)
+  submittedAt    DateTime
+  answeredAt     DateTime?
+  answerText     String?
+  costImpact     Boolean  @default(false)
+  scheduleImpactDays Int  @default(0)
+
+  @@unique([projectId, number])
+  @@index([projectId])
+  @@index([status])
+  @@map("rfis")
+}
+
+enum RfiStatus {
+  OPEN
+  ANSWERED
+  CLOSED
+}
+
+model ChangeOrder {
+  id                 String   @id @default(uuid())
+  projectId          String
+  project            Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  number             String
+  description        String
+  costImpactInr      Decimal  @db.Decimal(14, 2)
+  scheduleImpactDays Int
+  status             ChangeOrderStatus @default(PENDING)
+  submittedAt        DateTime
+
+  @@unique([projectId, number])
+  @@index([projectId])
+  @@map("change_orders")
+}
+
+enum ChangeOrderStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// ============================================================================
+// COMMISSIONING
+// ============================================================================
+
+model CommissioningTest {
+  id                 String   @id @default(uuid())
+  projectId          String
+  project            Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  standardRef        String   // "TIA-942" | "Uptime Tier III IST" | "BICSI 002"
+  system             String   // "UPS Plant" | "Chilled Water" | "Fire Suppression" ...
+  testProcedure      String
+  level              String   // "L1" .. "L5" integrated systems testing level
+  acceptanceCriteria String
+  actualValue        String?
+  result             TestResult @default(PENDING)
+  status             TestStatus @default(SCHEDULED)
+  scheduledFor       DateTime
+  executedBy         String?
+  executedAt         DateTime?
+
+  @@index([projectId])
+  @@index([status])
+  @@map("commissioning_tests")
+}
+
+enum TestResult {
+  PENDING
+  PASS
+  FAIL
+  CONDITIONAL_PASS
+}
+
+enum TestStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETE
+  BLOCKED
+}
+
+// ============================================================================
+// AUDIT TRAIL — every agent decision is traceable
+// ============================================================================
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  actorId    String?
+  actor      UserProfile? @relation(fields: [actorId], references: [id])
+
+  entityType String   // "Task" | "NegotiationSession" | "NonConformance" ...
+  entityId   String
+  action     String   // "created" | "resolved" | "escalated" | "risk_recomputed" ...
+  agentName  String?  // which AI agent performed this, null if human
+  payloadJson Json
+  createdAt  DateTime @default(now())
+
+  @@index([projectId])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
